@@ -68,6 +68,7 @@
 #define AML_UART_BAUD_MASK		0x7fffff
 #define AML_UART_BAUD_USE		BIT(23)
 #define AML_UART_BAUD_XTAL		BIT(24)
+#define AML_UART_BAUD_XTAL_DIV2		BIT(27)
 
 #define AML_UART_PORT_NUM		12
 #define AML_UART_PORT_OFFSET		6
@@ -253,14 +254,6 @@ static const char *meson_uart_type(struct uart_port *port)
 	return (port->type == PORT_MESON) ? "meson_uart" : NULL;
 }
 
-/*
- * This function is called only from probe() using a temporary io mapping
- * in order to perform a reset before setting up the device. Since the
- * temporarily mapped region was successfully requested, there can be no
- * console on this port at this time. Hence it is not necessary for this
- * function to acquire the port->lock. (Since there is no console on this
- * port at this time, the port->lock is not initialized yet.)
- */
 static void meson_uart_reset(struct uart_port *port)
 {
 	u32 val;
@@ -275,11 +268,8 @@ static void meson_uart_reset(struct uart_port *port)
 
 static int meson_uart_startup(struct uart_port *port)
 {
-	unsigned long flags;
 	u32 val;
 	int ret = 0;
-
-	spin_lock_irqsave(&port->lock, flags);
 
 	val = readl(port->membase + AML_UART_CONTROL);
 	val |= AML_UART_CLEAR_ERR;
@@ -296,8 +286,6 @@ static int meson_uart_startup(struct uart_port *port)
 	val = (AML_UART_RECV_IRQ(1) | AML_UART_XMIT_IRQ(port->fifosize / 2));
 	writel(val, port->membase + AML_UART_MISC);
 
-	spin_unlock_irqrestore(&port->lock, flags);
-
 	ret = request_irq(port->irq, meson_uart_interrupt, 0,
 			  port->name, port);
 
@@ -312,10 +300,15 @@ static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
 		cpu_relax();
 
 	if (port->uartclk == 24000000) {
-		val = ((port->uartclk / 3) / baud) - 1;
-		val |= AML_UART_BAUD_XTAL;
+		if (of_device_is_compatible(port->dev->of_node, "amlogic,meson-gxl-uart")) {
+			val = DIV_ROUND_CLOSEST(port->uartclk, 2 * baud) - 1;
+			val |= AML_UART_BAUD_XTAL | AML_UART_BAUD_XTAL_DIV2;
+		} else {
+			val = DIV_ROUND_CLOSEST(port->uartclk, 3 * baud) - 1;
+			val |= AML_UART_BAUD_XTAL;
+		}
 	} else {
-		val = ((port->uartclk * 10 / (baud * 4) + 5) / 10) - 1;
+		val = DIV_ROUND_CLOSEST(port->uartclk, 4 * baud) - 1;
 	}
 	val |= AML_UART_BAUD_USE;
 	writel(val, port->membase + AML_UART_REG5);
@@ -368,14 +361,10 @@ static void meson_uart_set_termios(struct uart_port *port,
 	else
 		val |= AML_UART_STOP_BIT_1SB;
 
-	if (cflags & CRTSCTS) {
-		if (port->flags & UPF_HARD_FLOW)
-			val &= ~AML_UART_TWO_WIRE_EN;
-		else
-			termios->c_cflag &= ~CRTSCTS;
-	} else {
+	if (cflags & CRTSCTS)
+		val &= ~AML_UART_TWO_WIRE_EN;
+	else
 		val |= AML_UART_TWO_WIRE_EN;
-	}
 
 	writel(val, port->membase + AML_UART_CONTROL);
 
@@ -530,7 +519,7 @@ static void meson_uart_enable_tx_engine(struct uart_port *port)
 	writel(val, port->membase + AML_UART_CONTROL);
 }
 
-static void meson_console_putchar(struct uart_port *port, int ch)
+static void meson_console_putchar(struct uart_port *port, unsigned char ch)
 {
 	if (!port->membase)
 		return;
@@ -639,10 +628,7 @@ meson_serial_early_console_setup(struct earlycon_device *device, const char *opt
 	device->con->write = meson_serial_early_console_write;
 	return 0;
 }
-/* Legacy bindings, should be removed when no more used */
-OF_EARLYCON_DECLARE(meson, "amlogic,meson-uart",
-		    meson_serial_early_console_setup);
-/* Stable bindings */
+
 OF_EARLYCON_DECLARE(meson, "amlogic,meson-ao-uart",
 		    meson_serial_early_console_setup);
 
@@ -685,25 +671,6 @@ static inline struct clk *meson_uart_probe_clock(struct device *dev,
 	return clk;
 }
 
-/*
- * This function gets clocks in the legacy non-stable DT bindings.
- * This code will be remove once all the platforms switch to the
- * new DT bindings.
- */
-static int meson_uart_probe_clocks_legacy(struct platform_device *pdev,
-					  struct uart_port *port)
-{
-	struct clk *clk = NULL;
-
-	clk = meson_uart_probe_clock(&pdev->dev, NULL);
-	if (IS_ERR(clk))
-		return PTR_ERR(clk);
-
-	port->uartclk = clk_get_rate(clk);
-
-	return 0;
-}
-
 static int meson_uart_probe_clocks(struct platform_device *pdev,
 				   struct uart_port *port)
 {
@@ -735,7 +702,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 	u32 fifosize = 64; /* Default is 64, 128 for EE UART_0 */
 	int ret = 0;
 	int irq;
-	bool has_rtscts;
 
 	if (pdev->dev.of_node)
 		pdev->id = of_alias_get_id(pdev->dev.of_node, "serial");
@@ -763,7 +729,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 		return irq;
 
 	of_property_read_u32(pdev->dev.of_node, "fifo-size", &fifosize);
-	has_rtscts = of_property_read_bool(pdev->dev.of_node, "uart-has-rtscts");
 
 	if (meson_ports[pdev->id]) {
 		dev_err(&pdev->dev, "port %d already allocated\n", pdev->id);
@@ -774,12 +739,7 @@ static int meson_uart_probe(struct platform_device *pdev)
 	if (!port)
 		return -ENOMEM;
 
-	/* Use legacy way until all platforms switch to new bindings */
-	if (of_device_is_compatible(pdev->dev.of_node, "amlogic,meson-uart"))
-		ret = meson_uart_probe_clocks_legacy(pdev, port);
-	else
-		ret = meson_uart_probe_clocks(pdev, port);
-
+	ret = meson_uart_probe_clocks(pdev, port);
 	if (ret)
 		return ret;
 
@@ -788,8 +748,6 @@ static int meson_uart_probe(struct platform_device *pdev)
 	port->mapsize = resource_size(res_mem);
 	port->irq = irq;
 	port->flags = UPF_BOOT_AUTOCONF | UPF_LOW_LATENCY;
-	if (has_rtscts)
-		port->flags |= UPF_HARD_FLOW;
 	port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_MESON_CONSOLE);
 	port->dev = &pdev->dev;
 	port->line = pdev->id;
@@ -826,13 +784,11 @@ static int meson_uart_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id meson_uart_dt_match[] = {
-	/* Legacy bindings, should be removed when no more used */
-	{ .compatible = "amlogic,meson-uart" },
-	/* Stable bindings */
 	{ .compatible = "amlogic,meson6-uart" },
 	{ .compatible = "amlogic,meson8-uart" },
 	{ .compatible = "amlogic,meson8b-uart" },
 	{ .compatible = "amlogic,meson-gx-uart" },
+	{ .compatible = "amlogic,meson-gxl-uart" },
 	{ /* sentinel */ },
 };
 MODULE_DEVICE_TABLE(of, meson_uart_dt_match);
